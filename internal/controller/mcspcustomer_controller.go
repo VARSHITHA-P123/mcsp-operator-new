@@ -202,7 +202,8 @@ func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			log.Error(createErr, "Failed to create deployment Job")
 			return ctrl.Result{}, createErr
 		}
-		log.Info("Deployment Job created", "customerName", customerName)
+		log.Info("Deployment Job created now customer", "customerName", customerName)
+
 	} else if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to get Job: %w", err)
 	}
@@ -361,7 +362,7 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 											},
 										},
 									},
-									// ResourceQuota
+									/* ResourceQuota
 									map[string]interface{}{
 										"complianceType": "musthave",
 										"objectDefinition": map[string]interface{}{
@@ -381,9 +382,9 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 												},
 											},
 										},
-									},
+									},*/
 									// LimitRange
-									map[string]interface{}{
+									/*map[string]interface{}{
 										"complianceType": "musthave",
 										"objectDefinition": map[string]interface{}{
 											"apiVersion": "v1",
@@ -408,7 +409,7 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 												},
 											},
 										},
-									},
+									},*/
 									// RoleBinding — image pull access
 									map[string]interface{}{
 										"complianceType": "musthave",
