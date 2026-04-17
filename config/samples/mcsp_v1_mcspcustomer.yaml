@@ -1,0 +1,7 @@
+apiVersion: mcsp.mcsp.io/v1
+kind: MCSPCustomer
+metadata:
+  name: oreo-customer
+  namespace: mcsp-operator-new-system
+spec:
+  customerName: oreo

@@ -1,0 +1,85 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: mcspcustomers.mcsp.mcsp.io
+spec:
+  group: mcsp.mcsp.io
+  names:
+    kind: MCSPCustomer
+    listKind: MCSPCustomerList
+    plural: mcspcustomers
+    singular: mcspcustomer
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.customerName
+      name: CustomerName
+      type: string
+    - jsonPath: .status.deployed
+      name: Deployed
+      type: boolean
+    - jsonPath: .status.message
+      name: Message
+      type: string
+    - jsonPath: .status.url
+      name: URL
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: MCSPCustomer is the Schema for the mcspcustomers API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: MCSPCustomerSpec defines the desired state of MCSPCustomer
+            properties:
+              customerName:
+                description: |-
+                  CustomerName is the name of the customer being onboarded
+                  This will be used to create the namespace, policy, job etc
+                minLength: 1
+                type: string
+            required:
+            - customerName
+            type: object
+          status:
+            description: MCSPCustomerStatus defines the observed state of MCSPCustomer
+            properties:
+              deployed:
+                description: Deployed indicates whether the customer is fully deployed
+                type: boolean
+              message:
+                description: Message provides information about the current state
+                  of the customer
+                type: string
+              url:
+                description: URL is the customer application endpoint
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

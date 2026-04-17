@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- mcsp_v1_mcspcustomer.yaml
+#+kubebuilder:scaffold:manifestskustomizesamples
