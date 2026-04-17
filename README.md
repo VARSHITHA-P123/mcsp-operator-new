@@ -1,114 +1,67 @@
-# mcsp-operator-new
-// TODO(user): Add simple overview of use/purpose
+# MCSP Operator
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes Operator built with Go and Kubebuilder that automates customer instance provisioning and deprovisioning on the MultiCloud SaaS Platform (MCSP).
 
-## Getting Started
+## What it does
 
-### Prerequisites
-- go version v1.21.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+When a customer instance is created, the operator automatically:
+- Creates a dedicated namespace for the customer using RHACM Policy
+- Sets up ResourceQuota and LimitRange on the namespace
+- Configures RBAC for image pulling
+- Binds the policy to the target cluster using PlacementBinding
+- Waits for the namespace to be ready
+- Deploys all microservices into the customer namespace via a Kubernetes Job
+- Updates the CR status with deployment state and URL
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+When a customer instance is deleted, the operator automatically cleans up in order:
+- Deletes the deployment Job
+- Removes the PlacementBinding
+- Removes the RHACM Policy
+- Deletes the customer namespace and everything inside it
 
-```sh
-make docker-build docker-push IMG=<some-registry>/mcsp-operator-new:tag
+## Key Features
+
+- Parallel onboarding and offboarding of up to 6 customers simultaneously
+- Finalizer-based cleanup guarantees no resources are left behind
+- Real-time status updates on the CR
+- Fast reconciliation with no blocking sleep calls
+
+## Tech Stack
+
+- Go
+- Kubebuilder v3.14.0
+- controller-runtime
+- OpenShift / Kubernetes
+- RHACM (Red Hat Advanced Cluster Management)
+
+## Project Structure
+
+```
+mcsp-operator-new/
+├── api/v1/
+│   └── mcspcustomer_types.go        # CR type definitions
+├── internal/controller/
+│   └── mcspcustomer_controller.go   # Reconciler logic
+├── config/
+│   ├── crd/                         # CRD yamls
+│   ├── rbac/                        # RBAC roles
+│   ├── manager/                     # Operator deployment
+│   └── samples/                     # Sample CRs
+├── deployer/
+│   └── Dockerfile                   # Deployer image
+└── cmd/
+    └── main.go                      # Entry point
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified. 
-And it is required to have access to pull the image from the working environment. 
-Make sure you have the proper permission to the registry if the above commands don’t work.
+## MCSPCustomer CR
 
-**Install the CRDs into the cluster:**
-
-```sh
-make install
+```yaml
+apiVersion: mcsp.mcsp.io/v1
+kind: MCSPCustomer
+metadata:
+  name: tesla
+  namespace: mcsp-operator-new-system
+spec:
+  customerName: tesla
 ```
-
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
-
-```sh
-make deploy IMG=<some-registry>/mcsp-operator-new:tag
-```
-
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin 
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following are the steps to build the installer and distribute this project to users.
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/mcsp-operator-new:tag
-```
-
-NOTE: The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without
-its dependencies.
-
-2. Using the installer
-
-Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/mcsp-operator-new/<tag or branch>/dist/install.yaml
-```
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
 
