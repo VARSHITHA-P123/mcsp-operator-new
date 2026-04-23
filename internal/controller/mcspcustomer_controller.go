@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,26 +38,31 @@ import (
 )
 
 const (
-	// customerFinalizerName is the finalizer added to every MCSPCustomer CR
-	// It blocks deletion until cleanup is complete
 	customerFinalizerName = "mcsp.mcsp.io/finalizer"
 
-	// Namespace where RHACM policies and jobs are created
+	// Namespace where RHACM policies are created
 	mcspPlatformNamespace = "mcsp-platform"
 
-	// Git repo details for deployment
-	gitRepoURL = "https://github.ibm.com/Manzanita/zps-mcsp-deploy.git"
-	gitBranch  = "mcsp-demo"
+	// ArgoCD namespace
+	argoCDNamespace = "openshift-operators"
 
-	// Deployer image used by the Job pod
-	deployerImage = "image-registry.openshift-image-registry.svc:5000/mcsp-platform/mcsp-customer-deployer:v1"
-	// Secret name containing the IBM GitHub token
-	gitTokenSecretName = "ibm-github-token"
-	gitTokenSecretKey  = "token"
+	// Git repo details — SSH format to match existing ArgoCD SSH credentials
+	gitRepoURL = "git@github.ibm.com:Manzanita/zps-mcsp-deploy.git"
+	gitBranch  = "mcsp-demo"
+	gitPath    = "yaml"
 
 	// Requeue intervals
-	namespaceWaitInterval = 5 * time.Second
+	namespaceWaitInterval  = 5 * time.Second
+	argoSyncPollInterval   = 15 * time.Second
+	argoDeletePollInterval = 5 * time.Second
+	argoDeleteMaxRetries   = 30
 )
+
+var argoAppGVK = schema.GroupVersionKind{
+	Group:   "argoproj.io",
+	Version: "v1alpha1",
+	Kind:    "Application",
+}
 
 // MCSPCustomerReconciler reconciles a MCSPCustomer object
 type MCSPCustomerReconciler struct {
@@ -70,11 +74,12 @@ type MCSPCustomerReconciler struct {
 // +kubebuilder:rbac:groups=mcsp.mcsp.io,resources=mcspcustomers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=mcsp.mcsp.io,resources=mcspcustomers/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy.open-cluster-management.io,resources=policies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy.open-cluster-management.io,resources=placementbindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=argoproj.io,resources=applications,verbs=get;list;watch;create;update;patch;delete
 
 func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -83,7 +88,6 @@ func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	mcspCustomer := &mcspv1.MCSPCustomer{}
 	if err := r.Get(ctx, req.NamespacedName, mcspCustomer); err != nil {
 		if errors.IsNotFound(err) {
-			// CR deleted before we could process it — nothing to do
 			log.Info("MCSPCustomer not found, might have been deleted")
 			return ctrl.Result{}, nil
 		}
@@ -95,29 +99,23 @@ func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// ── Deletion handling ─────────────────────────────────────────────────────
 	if !mcspCustomer.DeletionTimestamp.IsZero() {
-		// CR is being deleted — run cleanup
 		if controllerutil.ContainsFinalizer(mcspCustomer, customerFinalizerName) {
 			log.Info("MCSPCustomer is being deleted, starting cleanup", "customerName", customerName)
-
 			if err := r.cleanupCustomerResources(ctx, customerName, log); err != nil {
 				log.Error(err, "Failed to cleanup customer resources")
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 			}
-
-			// Cleanup done — remove finalizer so Kubernetes can delete the CR
 			controllerutil.RemoveFinalizer(mcspCustomer, customerFinalizerName)
 			if err := r.Update(ctx, mcspCustomer); err != nil {
 				log.Error(err, "Failed to remove finalizer")
 				return ctrl.Result{}, err
 			}
-
 			log.Info("MCSPCustomer deletion completed", "customerName", customerName)
 		}
 		return ctrl.Result{}, nil
 	}
 
-	// ── Step 2: Add finalizer if not present ─────────────────────────────────
-	// Finalizer blocks Kubernetes from deleting the CR until cleanup is done
+	// ── Step 2: Add finalizer ─────────────────────────────────────────────────
 	if !controllerutil.ContainsFinalizer(mcspCustomer, customerFinalizerName) {
 		log.Info("Adding finalizer to MCSPCustomer", "customerName", customerName)
 		controllerutil.AddFinalizer(mcspCustomer, customerFinalizerName)
@@ -125,13 +123,10 @@ func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			log.Error(err, "Failed to add finalizer")
 			return ctrl.Result{}, err
 		}
-		// controller-runtime will requeue automatically after Update
 		return ctrl.Result{}, nil
 	}
 
 	// ── Step 3: Create RHACM Policy ──────────────────────────────────────────
-	// This tells RHACM to create namespace, resourcequota, limitrange
-	// and rolebinding on the managed cluster
 	rhacmPolicy := &unstructured.Unstructured{}
 	rhacmPolicy.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "policy.open-cluster-management.io",
@@ -153,7 +148,6 @@ func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// ── Step 4: Create PlacementBinding ──────────────────────────────────────
-	// Binds the policy to the placement so RHACM knows which cluster to enforce on
 	placementBinding := &unstructured.Unstructured{}
 	placementBinding.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "policy.open-cluster-management.io",
@@ -174,9 +168,7 @@ func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, fmt.Errorf("failed to get PlacementBinding: %w", err)
 	}
 
-	// ── Step 5: Wait for namespace to be ready ────────────────────────────────
-	// RHACM takes a few seconds to create the namespace on the managed cluster
-	// We poll every 5 seconds until it appears
+	// ── Step 5: Wait for namespace ────────────────────────────────────────────
 	namespace := &corev1.Namespace{}
 	if err := r.Get(ctx, types.NamespacedName{Name: customerName}, namespace); err != nil {
 		if errors.IsNotFound(err) {
@@ -188,39 +180,92 @@ func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	log.Info("Namespace is ready", "namespace", customerName)
 
-	// ── Step 6: Create Deployment Job ────────────────────────────────────────
-	// Job clones the git repo and runs deploy.sh to deploy all microservices
-	// into the customer namespace
-	job := &batchv1.Job{}
-	err = r.Get(ctx, types.NamespacedName{
-		Name:      customerName + "-deploy-job",
-		Namespace: mcspPlatformNamespace,
-	}, job)
-	if err != nil && errors.IsNotFound(err) {
-		log.Info("Creating deployment job", "customerName", customerName)
-		if createErr := r.Create(ctx, buildDeploymentJob(customerName)); createErr != nil {
-			log.Error(createErr, "Failed to create deployment Job")
-			return ctrl.Result{}, createErr
-		}
-		log.Info("Deployment Job created now customer", "customerName", customerName)
-
-	} else if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get Job: %w", err)
+	// ── Step 6: Create url secret in customer namespace ───────────────────────
+	if err := r.ensureURLSecret(ctx, log, customerName); err != nil {
+		log.Error(err, "Failed to ensure URL secret")
+		return ctrl.Result{}, err
 	}
 
-	// ── Step 7: Update Status ─────────────────────────────────────────────────
-	appURL := fmt.Sprintf("https://mcsp-app-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com", customerName)
+	// ── Step 7: Create ArgoCD Application ────────────────────────────────────
+	argoApp := &unstructured.Unstructured{}
+	argoApp.SetGroupVersionKind(argoAppGVK)
+	err = r.Get(ctx, types.NamespacedName{
+		Name:      customerName + "-app",
+		Namespace: argoCDNamespace,
+	}, argoApp)
+	if err != nil && errors.IsNotFound(err) {
+		log.Info("Creating ArgoCD Application", "customerName", customerName)
+		if createErr := r.Create(ctx, buildArgoApp(customerName)); createErr != nil {
+			log.Error(createErr, "Failed to create ArgoCD Application")
+			return ctrl.Result{}, createErr
+		}
+		log.Info("ArgoCD Application created", "customerName", customerName)
+		r.updateStatus(ctx, mcspCustomer, false, "ArgoCD syncing microservices...", "")
+		return ctrl.Result{RequeueAfter: argoSyncPollInterval}, nil
+	} else if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get ArgoCD Application: %w", err)
+	}
+
+	// ── Step 8: Poll ArgoCD sync + health ─────────────────────────────────────
+	syncStatus, healthStatus := extractArgoStatus(argoApp)
+	log.Info("ArgoCD status", "sync", syncStatus, "health", healthStatus, "customer", customerName)
+
+	if syncStatus != "Synced" || healthStatus != "Healthy" {
+		r.updateStatus(ctx, mcspCustomer, false,
+			fmt.Sprintf("ArgoCD Sync: %s | Health: %s", syncStatus, healthStatus), "")
+		log.Info("ArgoCD not yet Synced+Healthy, requeuing", "customerName", customerName)
+		return ctrl.Result{RequeueAfter: argoSyncPollInterval}, nil
+	}
+
+	// ── Step 9: Update status → fully deployed ────────────────────────────────
+	appURL := fmt.Sprintf("https://manzanita-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com", customerName)
 	r.updateStatus(ctx, mcspCustomer, true,
-		fmt.Sprintf("Customer %s deployment job started", customerName),
+		fmt.Sprintf("ArgoCD Sync: %s | Health: %s", syncStatus, healthStatus),
 		appURL)
 
 	log.Info("MCSPCustomer reconciled successfully", "customerName", customerName)
 	return ctrl.Result{}, nil
 }
 
+// ── ensureURLSecret ───────────────────────────────────────────────────────────
+func (r *MCSPCustomerReconciler) ensureURLSecret(ctx context.Context, log logr.Logger, customerName string) error {
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      "url",
+		Namespace: customerName,
+	}, existing)
+	if err == nil {
+		return nil
+	}
+	if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to get url secret: %w", err)
+	}
+
+	urlSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "url",
+			Namespace: customerName,
+			Labels: map[string]string{
+				"tenant": customerName,
+			},
+		},
+		StringData: map[string]string{
+			"proxy-url": fmt.Sprintf("https://manzanita-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com", customerName),
+			"api-url":   fmt.Sprintf("https://manzanita-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com/api", customerName),
+			"ws-url":    fmt.Sprintf("wss://manzanita-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com/ws", customerName),
+			"redis-url": fmt.Sprintf("https://redis-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com", customerName),
+		},
+	}
+
+	if err := r.Create(ctx, urlSecret); err != nil {
+		return fmt.Errorf("failed to create url secret: %w", err)
+	}
+
+	log.Info("URL secret created", "customerName", customerName)
+	return nil
+}
+
 // ── updateStatus ──────────────────────────────────────────────────────────────
-// Updates the MCSPCustomer status subresource
-// Errors are logged but not returned — status update failure should not block reconcile
 func (r *MCSPCustomerReconciler) updateStatus(
 	ctx context.Context,
 	mcspCustomer *mcspv1.MCSPCustomer,
@@ -236,25 +281,58 @@ func (r *MCSPCustomerReconciler) updateStatus(
 	}
 }
 
+// ── extractArgoStatus ─────────────────────────────────────────────────────────
+func extractArgoStatus(app *unstructured.Unstructured) (syncStatus, healthStatus string) {
+	syncStatus, healthStatus = "Unknown", "Unknown"
+	status, found, _ := unstructured.NestedMap(app.Object, "status")
+	if !found {
+		return
+	}
+	if s, _, err := unstructured.NestedString(status, "sync", "status"); err == nil && s != "" {
+		syncStatus = s
+	}
+	if h, _, err := unstructured.NestedString(status, "health", "status"); err == nil && h != "" {
+		healthStatus = h
+	}
+	return
+}
+
 // ── Cleanup ───────────────────────────────────────────────────────────────────
-// Runs when MCSPCustomer CR is deleted
-// Order: Job → PlacementBinding → RHACM Policy → Namespace
 func (r *MCSPCustomerReconciler) cleanupCustomerResources(
 	ctx context.Context, customerName string, log logr.Logger,
 ) error {
 	log.Info("Starting cleanup for customer", "customerName", customerName)
 
-	// Step 1: Delete Deployment Job
-	job := &batchv1.Job{}
+	// Step 1: Delete ArgoCD Application
+	argoApp := &unstructured.Unstructured{}
+	argoApp.SetGroupVersionKind(argoAppGVK)
 	if err := r.Get(ctx, types.NamespacedName{
-		Name:      customerName + "-deploy-job",
-		Namespace: mcspPlatformNamespace,
-	}, job); err == nil {
-		if delErr := r.Delete(ctx, job); delErr != nil && !errors.IsNotFound(delErr) {
-			log.Error(delErr, "Failed to delete Job")
+		Name:      customerName + "-app",
+		Namespace: argoCDNamespace,
+	}, argoApp); err == nil {
+		log.Info("Deleting ArgoCD Application", "customerName", customerName)
+		if delErr := r.Delete(ctx, argoApp); delErr != nil && !errors.IsNotFound(delErr) {
+			log.Error(delErr, "Failed to delete ArgoCD Application")
 			return delErr
 		}
-		log.Info("Job deleted", "customerName", customerName)
+		for i := 0; i < argoDeleteMaxRetries; i++ {
+			check := &unstructured.Unstructured{}
+			check.SetGroupVersionKind(argoAppGVK)
+			if chkErr := r.Get(ctx, types.NamespacedName{
+				Name:      customerName + "-app",
+				Namespace: argoCDNamespace,
+			}, check); errors.IsNotFound(chkErr) {
+				log.Info("ArgoCD Application fully deleted", "customerName", customerName)
+				break
+			}
+			if i == argoDeleteMaxRetries-1 {
+				return fmt.Errorf("timed out waiting for ArgoCD Application %s-app to be deleted", customerName)
+			}
+			log.Info("Waiting for ArgoCD cascade delete...", "attempt", i+1)
+			time.Sleep(argoDeletePollInterval)
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to get ArgoCD Application: %w", err)
 	}
 
 	// Step 2: Delete PlacementBinding
@@ -276,7 +354,6 @@ func (r *MCSPCustomerReconciler) cleanupCustomerResources(
 	}
 
 	// Step 3: Delete RHACM Policy
-	// Removing the policy stops RHACM from enforcing the namespace on the managed cluster
 	rhacmPolicy := &unstructured.Unstructured{}
 	rhacmPolicy.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "policy.open-cluster-management.io",
@@ -294,7 +371,7 @@ func (r *MCSPCustomerReconciler) cleanupCustomerResources(
 		log.Info("RHACM Policy deleted", "customerName", customerName)
 	}
 
-	// Step 4: Delete Namespace and wait for it to be fully gone
+	// Step 4: Delete Namespace
 	namespace := &corev1.Namespace{}
 	if err := r.Get(ctx, types.NamespacedName{Name: customerName}, namespace); err == nil {
 		if delErr := r.Delete(ctx, namespace); delErr != nil && !errors.IsNotFound(delErr) {
@@ -302,9 +379,6 @@ func (r *MCSPCustomerReconciler) cleanupCustomerResources(
 			return delErr
 		}
 		log.Info("Namespace deletion initiated", "customerName", customerName)
-
-		// Check if namespace is gone — if not, return error to trigger requeue
-		// This avoids time.Sleep blocking the worker goroutine
 		if checkErr := r.Get(ctx, types.NamespacedName{Name: customerName}, namespace); checkErr != nil {
 			if !errors.IsNotFound(checkErr) {
 				return checkErr
@@ -321,8 +395,53 @@ func (r *MCSPCustomerReconciler) cleanupCustomerResources(
 
 // ── Builder helpers ───────────────────────────────────────────────────────────
 
-// buildRHACMPolicy creates the RHACM Policy object that enforces:
-// Namespace, ResourceQuota, LimitRange, RoleBinding on the managed cluster
+func buildArgoApp(customerName string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "argoproj.io/v1alpha1",
+			"kind":       "Application",
+			"metadata": map[string]interface{}{
+				"name":      customerName + "-app",
+				"namespace": argoCDNamespace,
+				"labels": map[string]interface{}{
+					"tenant": customerName,
+				},
+				"finalizers": []interface{}{
+					"resources-finalizer.argocd.argoproj.io",
+				},
+			},
+			"spec": map[string]interface{}{
+				"project": "default",
+				"source": map[string]interface{}{
+					"repoURL":        gitRepoURL,
+					"targetRevision": gitBranch,
+					"path":           gitPath,
+					"directory": map[string]interface{}{
+						"recurse": true,
+					},
+				},
+				"destination": map[string]interface{}{
+					"server":    "https://kubernetes.default.svc",
+					"namespace": customerName,
+				},
+				"syncPolicy": map[string]interface{}{
+					"automated": map[string]interface{}{
+						"prune":    true,
+						"selfHeal": true,
+					},
+					"syncOptions": []interface{}{
+						"CreateNamespace=false",
+						"ServerSideApply=true",
+					},
+				},
+			},
+		},
+	}
+}
+
+// buildRHACMPolicy creates the RHACM Policy
+// The namespace label argocd.argoproj.io/managed-by is critical
+// It tells ArgoCD this namespace is managed by it so it can deploy into it
 func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -347,7 +466,7 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 								"remediationAction": "enforce",
 								"severity":          "low",
 								"object-templates": []interface{}{
-									// Namespace
+									// Namespace with argocd managed-by label
 									map[string]interface{}{
 										"complianceType": "musthave",
 										"objectDefinition": map[string]interface{}{
@@ -358,58 +477,12 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 												"labels": map[string]interface{}{
 													"tenant":   customerName,
 													"customer": "true",
+													// Critical — tells ArgoCD this namespace is managed by it
+													"argocd.argoproj.io/managed-by": argoCDNamespace,
 												},
 											},
 										},
 									},
-									/* ResourceQuota
-									map[string]interface{}{
-										"complianceType": "musthave",
-										"objectDefinition": map[string]interface{}{
-											"apiVersion": "v1",
-											"kind":       "ResourceQuota",
-											"metadata": map[string]interface{}{
-												"name":      customerName + "-quota",
-												"namespace": customerName,
-											},
-											"spec": map[string]interface{}{
-												"hard": map[string]interface{}{
-													"requests.cpu":    "4",
-													"requests.memory": "8Gi",
-													"limits.cpu":      "8",
-													"limits.memory":   "16Gi",
-													"pods":            "50",
-												},
-											},
-										},
-									},*/
-									// LimitRange
-									/*map[string]interface{}{
-										"complianceType": "musthave",
-										"objectDefinition": map[string]interface{}{
-											"apiVersion": "v1",
-											"kind":       "LimitRange",
-											"metadata": map[string]interface{}{
-												"name":      customerName + "-limits",
-												"namespace": customerName,
-											},
-											"spec": map[string]interface{}{
-												"limits": []interface{}{
-													map[string]interface{}{
-														"type": "Container",
-														"default": map[string]interface{}{
-															"cpu":    "500m",
-															"memory": "512Mi",
-														},
-														"defaultRequest": map[string]interface{}{
-															"cpu":    "100m",
-															"memory": "128Mi",
-														},
-													},
-												},
-											},
-										},
-									},*/
 									// RoleBinding — image pull access
 									map[string]interface{}{
 										"complianceType": "musthave",
@@ -444,8 +517,6 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 	}
 }
 
-// buildPlacementBinding binds the RHACM Policy to the placement
-// so RHACM knows which cluster to enforce the policy on
 func buildPlacementBinding(customerName string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -471,71 +542,7 @@ func buildPlacementBinding(customerName string) *unstructured.Unstructured {
 	}
 }
 
-// buildDeploymentJob creates the Kubernetes Job that deploys
-// all microservices into the customer namespace
-func buildDeploymentJob(customerName string) *batchv1.Job {
-	ttl := int32(3600)       // auto-delete job after 1 hour
-	backoffLimit := int32(3) // retry up to 3 times on failure
-
-	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      customerName + "-deploy-job",
-			Namespace: mcspPlatformNamespace,
-			Labels: map[string]string{
-				"app":    "mcsp-deployer",
-				"tenant": customerName,
-			},
-		},
-		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: &ttl,
-			BackoffLimit:            &backoffLimit,
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":    "mcsp-deployer",
-						"tenant": customerName,
-					},
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName: "mcsp-deployer",
-					RestartPolicy:      corev1.RestartPolicyOnFailure,
-					Containers: []corev1.Container{
-						{
-							Name:    "deployer",
-							Image:   deployerImage,
-							Command: []string{"/bin/bash", "-c"},
-							Args: []string{
-								fmt.Sprintf(`
-									git clone https://$(GIT_TOKEN)@%s -b %s /tmp/deploy &&
-									cd /tmp/deploy &&
-									sh deploy.sh %s
-								`, gitRepoURL[8:], gitBranch, customerName),
-							},
-							Env: []corev1.EnvVar{
-								{
-									Name: "GIT_TOKEN",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: gitTokenSecretName,
-											},
-											Key: gitTokenSecretKey,
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
 // ── Manager setup ─────────────────────────────────────────────────────────────
-
-// SetupWithManager sets up the controller with the Manager
-// MaxConcurrentReconciles: 6 allows 6 customers to onboard/offboard simultaneously
 func (r *MCSPCustomerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mcspv1.MCSPCustomer{}).

@@ -8,6 +8,7 @@ rules:
   - ""
   resources:
   - namespaces
+  - secrets
   - serviceaccounts
   verbs:
   - create
@@ -18,9 +19,9 @@ rules:
   - update
   - watch
 - apiGroups:
-  - batch
+  - argoproj.io
   resources:
-  - jobs
+  - applications
   verbs:
   - create
   - delete
