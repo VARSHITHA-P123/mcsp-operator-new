@@ -1,7 +1,7 @@
 apiVersion: mcsp.mcsp.io/v1
 kind: MCSPCustomer
 metadata:
-  name: mcsp-customer-sample
+  name: test-configmap
   namespace: mcsp-operator-new-system
 spec:
-  customerName: mcsp-customer-sample
+  customerName: test-configmap

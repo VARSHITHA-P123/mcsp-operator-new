@@ -18,6 +18,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -40,23 +41,30 @@ import (
 const (
 	customerFinalizerName = "mcsp.mcsp.io/finalizer"
 
-	// Namespace where RHACM policies are created
-	mcspPlatformNamespace = "mcsp-platform"
-
-	// ArgoCD namespace
-	argoCDNamespace = "openshift-operators"
-
-	// Git repo details — SSH format to match existing ArgoCD SSH credentials
-	gitRepoURL = "git@github.ibm.com:Manzanita/zps-mcsp-deploy.git"
-	gitBranch  = "mcsp-demo"
-	gitPath    = "yaml"
-
 	// Requeue intervals
 	namespaceWaitInterval  = 5 * time.Second
 	argoSyncPollInterval   = 15 * time.Second
 	argoDeletePollInterval = 5 * time.Second
 	argoDeleteMaxRetries   = 30
 )
+
+var (
+	mcspPlatformNamespace = getEnvOrDefault("MCSP_PLATFORM_NAMESPACE", "mcsp-platform")
+	argoCDNamespace       = getEnvOrDefault("ARGOCD_NAMESPACE", "openshift-operators")
+	gitRepoURL            = getEnvOrDefault("GIT_REPO_URL", "git@github.ibm.com:Manzanita/zps-mcsp-deploy.git")
+	gitBranch             = getEnvOrDefault("GIT_BRANCH", "mcsp-demo")
+	gitPath               = getEnvOrDefault("GIT_PATH", "yaml")
+	clusterDomain         = getEnvOrDefault("CLUSTER_DOMAIN", "zps-mcsp-cluster.cp.fyre.ibm.com")
+	placementName         = getEnvOrDefault("PLACEMENT_NAME", "mcsp-hello-world-placement")
+)
+
+// getEnvOrDefault reads an environment variable and falls back to a default value
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
 var argoAppGVK = schema.GroupVersionKind{
 	Group:   "argoproj.io",
@@ -218,7 +226,7 @@ func (r *MCSPCustomerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// ── Step 9: Update status → fully deployed ────────────────────────────────
-	appURL := fmt.Sprintf("https://manzanita-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com", customerName)
+	appURL := fmt.Sprintf("https://manzanita-%s.apps.%s", customerName, clusterDomain)
 	r.updateStatus(ctx, mcspCustomer, true,
 		fmt.Sprintf("ArgoCD Sync: %s | Health: %s", syncStatus, healthStatus),
 		appURL)
@@ -250,10 +258,10 @@ func (r *MCSPCustomerReconciler) ensureURLSecret(ctx context.Context, log logr.L
 			},
 		},
 		StringData: map[string]string{
-			"proxy-url": fmt.Sprintf("https://manzanita-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com", customerName),
-			"api-url":   fmt.Sprintf("https://manzanita-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com/api", customerName),
-			"ws-url":    fmt.Sprintf("wss://manzanita-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com/ws", customerName),
-			"redis-url": fmt.Sprintf("https://redis-%s.apps.zps-mcsp-cluster.cp.fyre.ibm.com", customerName),
+			"proxy-url": fmt.Sprintf("https://manzanita-%s.apps.%s", customerName, clusterDomain),
+			"api-url":   fmt.Sprintf("https://manzanita-%s.apps.%s/api", customerName, clusterDomain),
+			"ws-url":    fmt.Sprintf("wss://manzanita-%s.apps.%s/ws", customerName, clusterDomain),
+			"redis-url": fmt.Sprintf("https://redis-%s.apps.%s", customerName, clusterDomain),
 		},
 	}
 
@@ -394,7 +402,6 @@ func (r *MCSPCustomerReconciler) cleanupCustomerResources(
 }
 
 // ── Builder helpers ───────────────────────────────────────────────────────────
-
 func buildArgoApp(customerName string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -466,7 +473,6 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 								"remediationAction": "enforce",
 								"severity":          "low",
 								"object-templates": []interface{}{
-									// Namespace with argocd managed-by label
 									map[string]interface{}{
 										"complianceType": "musthave",
 										"objectDefinition": map[string]interface{}{
@@ -475,15 +481,13 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 											"metadata": map[string]interface{}{
 												"name": customerName,
 												"labels": map[string]interface{}{
-													"tenant":   customerName,
-													"customer": "true",
-													// Critical — tells ArgoCD this namespace is managed by it
+													"tenant":                        customerName,
+													"customer":                      "true",
 													"argocd.argoproj.io/managed-by": argoCDNamespace,
 												},
 											},
 										},
 									},
-									// RoleBinding — image pull access
 									map[string]interface{}{
 										"complianceType": "musthave",
 										"objectDefinition": map[string]interface{}{
@@ -516,7 +520,6 @@ func buildRHACMPolicy(customerName string) *unstructured.Unstructured {
 		},
 	}
 }
-
 func buildPlacementBinding(customerName string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -527,7 +530,7 @@ func buildPlacementBinding(customerName string) *unstructured.Unstructured {
 				"namespace": mcspPlatformNamespace,
 			},
 			"placementRef": map[string]interface{}{
-				"name":     "mcsp-hello-world-placement",
+				"name":     placementName,
 				"apiGroup": "cluster.open-cluster-management.io",
 				"kind":     "Placement",
 			},
